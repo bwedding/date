@@ -4138,7 +4138,16 @@ static
 std::string
 getTimeZoneKeyName()
 {
-    DYNAMIC_TIME_ZONE_INFORMATION dtzi{};
+	static bool read = false;
+    static DYNAMIC_TIME_ZONE_INFORMATION dtzi{};
+	if (!read)
+	{
+		auto result = GetDynamicTimeZoneInformation(&dtzi);
+		if (result == TIME_ZONE_ID_INVALID)
+			throw std::runtime_error("current_zone(): GetDynamicTimeZoneInformation()"
+				" reported TIME_ZONE_ID_INVALID.");
+		read = true;
+	}
     auto result = GetDynamicTimeZoneInformation(&dtzi);
     if (result == TIME_ZONE_ID_INVALID)
         throw std::runtime_error("current_zone(): GetDynamicTimeZoneInformation()"
@@ -4155,7 +4164,14 @@ getTimeZoneKeyName()
 const time_zone*
 tzdb::current_zone() const
 {
-    std::string win_tzid = getTimeZoneKeyName();
+    static std::string win_tzid;
+    static bool read = false;
+	if (!read)
+	{
+		win_tzid = getTimeZoneKeyName();
+		read = true;
+	}
+   
     std::string standard_tzid;
     if (!native_to_standard_timezone_name(win_tzid, standard_tzid))
     {
