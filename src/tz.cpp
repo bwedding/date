@@ -1083,10 +1083,6 @@ detail::MonthDayTime::to_sys_days(date::year y) const
     using namespace std::chrono;
     using namespace date;
 
-    // Handle most common case first
-    if (type_ == month_day)
-        return sys_days(y / u.month_day_);
-
     // Handle other cases
     switch (type_)
     {
@@ -1708,7 +1704,8 @@ std::pair<const Rule*, date::year>
 find_next_rule(const Rule* r, date::year y)
 {
     using namespace date;
-    auto const& rules = get_tzdb().rules;
+    static auto const& rules = get_tzdb().rules;
+
     if (y == r->ending_year())
     {
         if (r == &rules.back() || r->name() != r[1].name())
@@ -1816,73 +1813,150 @@ find_rule_for_zone(const std::pair<const Rule*, const Rule*>& eqr,
 static
 sys_info
 find_rule(const std::pair<const Rule*, date::year>& first_rule,
-          const std::pair<const Rule*, date::year>& last_rule,
-          const date::year& y, const std::chrono::seconds& offset,
-          const MonthDayTime& mdt, const std::chrono::minutes& initial_save,
-          const std::string& initial_abbrev)
+    const std::pair<const Rule*, date::year>& last_rule,
+    const date::year& y, const std::chrono::seconds& offset,
+    const MonthDayTime& mdt, const std::chrono::minutes& initial_save,
+    const std::string& initial_abbrev)
 {
     using namespace std::chrono;
     using namespace date;
-    
-    // Initialize result
-    sys_info x{sys_days(year::min()/min_day), sys_days(year::max()/max_day),
-               seconds{0}, initial_save, initial_abbrev};
-    
-    // Start with first rule
-    auto r = first_rule.first;
-    auto ry = first_rule.second;
-    if (r == nullptr)
-        return x;
-        
-    // Calculate target time once
-    auto tx = mdt.to_sys(y, offset, x.save);
-    
-    // Special case: Before first rule
-    auto tr = r->mdt().to_sys(ry, offset, x.save);
-    if (tx < tr) {
-        x.end = tr;
-        return x;
-    }
-    
-    // Find applicable rule by advancing until we find the right one
-    while (r != nullptr) {
-        // Save current rule info before potentially advancing
-        const auto current_r = r;
-        const auto current_ry = ry;
-        const auto current_tr = tr;
-        
-        // Get next rule to check if we should advance
-        if (r != last_rule.first || ry != last_rule.second) {
-            std::tie(r, ry) = find_next_rule(current_r, current_ry);
-            if (r != nullptr)
-                tr = r->mdt().to_sys(ry, offset, x.save);
-        } else {
-            r = nullptr; // Mark as last rule
+
+    // Structure to represent a rule transition
+    struct rule_transition {
+        sys_seconds time_point;  // Changed from sys_days to sys_seconds
+        const Rule* rule;
+        date::year rule_year;
+        std::chrono::minutes save;
+        std::string abbrev;
+    };
+
+    // Cache for rule transitions
+    // Key: hash of first_rule, last_rule, offset
+    // Value: sorted vector of rule transitions
+    struct cache_key {
+        const Rule* first_rule;
+        date::year first_year;
+        const Rule* last_rule;
+        date::year last_year;
+        std::chrono::seconds offset;
+
+        bool operator==(const cache_key& other) const {
+            return first_rule == other.first_rule &&
+                first_year == other.first_year &&
+                last_rule == other.last_rule &&
+                last_year == other.last_year &&
+                offset == other.offset;
         }
-        
-        // If we've reached the end or gone past target time, use current rule
-        if (r == nullptr || tx < tr) {
-            // Set begin time (accounting for previous rule's save value)
-            std::chrono::minutes prev_save = initial_save;
-            if (!(current_r == first_rule.first && current_ry == first_rule.second)) {
-                auto [prev_r, prev_ry] = find_previous_rule(current_r, current_ry);
-                prev_save = prev_r->save();
+    };
+
+    struct cache_key_hash {
+        std::size_t operator()(const cache_key& key) const {
+            std::size_t h1 = std::hash<const void*>{}(key.first_rule);
+            std::size_t h2 = std::hash<int>{}(static_cast<int>(key.first_year));
+            std::size_t h3 = std::hash<const void*>{}(key.last_rule);
+            std::size_t h4 = std::hash<int>{}(static_cast<int>(key.last_year));
+            std::size_t h5 = std::hash<int64_t>{}(key.offset.count());
+
+            return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ (h5 << 4);
+        }
+    };
+
+    static std::unordered_map<cache_key, std::vector<rule_transition>, cache_key_hash> rule_cache;
+
+    // Try to get cached rule transitions
+    cache_key key{ first_rule.first, first_rule.second, last_rule.first, last_rule.second, offset };
+
+    // Check if we need to build the cache
+    if (rule_cache.find(key) == rule_cache.end()) {
+        // Build the cache of rule transitions
+        std::vector<rule_transition> transitions;
+
+        auto r = first_rule.first;
+        auto ry = first_rule.second;
+        std::chrono::minutes prev_save = initial_save;
+
+        // Add all rules to the cache
+        while (r != nullptr) {
+            // Calculate transition time
+            auto tr = r->mdt().to_sys(ry, offset, prev_save);
+
+            // Add to transitions
+            transitions.push_back(rule_transition{
+    tr,                // time_point
+    r,                 // rule pointer
+    ry,                // rule year
+    r->save(),         // save value
+    r->abbrev()        // abbreviation
+                });
+
+            // Save for next iteration
+            prev_save = r->save();
+
+            // Check if this is the last rule
+            if (r == last_rule.first && ry == last_rule.second) {
+                break;
             }
-            
-            // Populate result
-            x.begin = current_r->mdt().to_sys(current_ry, offset, prev_save);
-            x.save = current_r->save();
-            x.abbrev = current_r->abbrev();
-            x.end = (r == nullptr) ? sys_days(year::max()/max_day) : tr;
-            
-            return x; // Early return
+
+            // Get next rule
+            std::tie(r, ry) = find_next_rule(r, ry);
         }
-        
-        // Update save time for next iteration
-        x.save = current_r->save();
+
+        // Store in cache
+        rule_cache[key] = std::move(transitions);
     }
-    
-    return x; // Fallback return
+
+    const auto& transitions = rule_cache[key];
+
+    // Initialize result
+    sys_info x{ sys_days(year::min() / min_day), sys_days(year::max() / max_day),
+               seconds{0}, initial_save, initial_abbrev };
+
+    // Handle empty rule set
+    if (transitions.empty()) {
+        return x;
+    }
+
+    // Calculate target time
+    auto tx = mdt.to_sys(y, offset, initial_save);
+
+    // Find applicable rule
+    if (tx < transitions.front().time_point) {
+        // Before first rule
+        x.end = transitions.front().time_point;
+        return x;
+    }
+
+    // Find the last transition before or at tx
+    auto it = std::upper_bound(
+        transitions.begin(),
+        transitions.end(),
+        tx,
+        [](const sys_seconds& time, const rule_transition& rt) {
+            return time < rt.time_point;
+        }
+    );
+
+    if (it == transitions.begin()) {
+        // Before first rule (should be handled above)
+        x.end = transitions.front().time_point;
+        return x;
+    }
+
+    // Move back to the last transition before tx
+    --it;
+
+    // Set result based on found transition
+    x.begin = it->time_point;
+    x.save = it->save;
+    x.abbrev = it->abbrev;
+
+    // Set end time
+    if (std::next(it) != transitions.end()) {
+        x.end = std::next(it)->time_point;
+    }
+    // else end stays at max
+
+    return x;
 }
 
 // zonelet
